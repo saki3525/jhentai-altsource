@@ -1,0 +1,2 @@
+# 统一换行符：仓库内一律 LF，检出时也不转换（GitHub Actions 对换行符不敏感，但避免持续出现 autocrlf 警告）
+* text=auto eol=lf

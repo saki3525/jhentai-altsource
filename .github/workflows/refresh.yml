@@ -1,0 +1,106 @@
+name: Refresh AltSource
+
+# Self-hosted AltSource feed, zero coupling with upstream workflows.
+# Reads jiangtian616/JHenTai's LATEST RELEASE (the single source of truth:
+# its IPA asset name matches the actual shipped binary) and rebuilds
+# altsource/AltSource.json. Immune to upstream tag/pubspec mismatches or
+# a broken upstream publish step: if the release exists with an IPA, the
+# feed is correct.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"        # daily 03:17 UTC — upstream ships roughly monthly, this is plenty
+  workflow_dispatch:
+  repository_dispatch:
+    types: [refresh-altsource]  # manual ping: gh api repos/<you>/<repo>/dispatches -f event_type=refresh-altsource
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM: jiangtian616/JHenTai
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull static base (icons/screenshots/etc.) from upstream repo
+        run: |
+          set -euo pipefail
+          if curl -fsSL "https://raw.githubusercontent.com/${UPSTREAM}/master/altsource/AltSource.json" -o /tmp/base.json; then
+            echo "using upstream AltSource.json as static base"
+          else
+            echo "::warning::upstream base unavailable, using in-repo copy"
+            cp altsource/AltSource.json /tmp/base.json
+          fi
+
+      - name: Derive latest version from upstream release assets
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REL_JSON=$(gh api "repos/${UPSTREAM}/releases/latest")
+
+          ASSET=$(jq -r '.assets[]
+                         | select(.name | test("^JHenTai_.*\\.ipa$"))
+                         | [.name, .browser_download_url, (.size | tostring)]
+                         | @tsv' <<<"$REL_JSON" | head -n1)
+          if [ -z "$ASSET" ]; then
+            echo "::warning::latest release has no JHenTai_*.ipa asset, keeping current feed"
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          IFS=$'\t' read -r NAME URL SIZE <<<"$ASSET"
+
+          VER="${NAME#JHenTai_}"; VER="${VER%.ipa}"        # e.g. 8.0.18+341 — always matches the real binary
+          BASE="${VER%%+*}"; BUILD="${VER##*+}"
+
+          jq -r '.body // ""' <<<"$REL_JSON" > /tmp/desc.md
+
+          {
+            echo "skip=false"
+            echo "version=${BASE}"
+            echo "build=${BUILD}"
+            echo "date=$(jq -r '.published_at' <<<"$REL_JSON")"
+            echo "url=${URL}"
+            echo "size=${SIZE}"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Merge into feed
+        if: steps.rel.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          jq \
+            --arg version "${{ steps.rel.outputs.version }}" \
+            --arg build   "${{ steps.rel.outputs.build }}" \
+            --arg date    "${{ steps.rel.outputs.date }}" \
+            --arg url     "${{ steps.rel.outputs.url }}" \
+            --argjson size "${{ steps.rel.outputs.size }}" \
+            --rawfile desc /tmp/desc.md \
+            '.apps[0].versions = (
+               [{ version: $version,
+                  buildVersion: $build,
+                  date: $date,
+                  localizedDescription: $desc,
+                  downloadURL: $url,
+                  size: $size }] +
+               ((.apps[0].versions // [])
+                 | map(select(.version != $version or .buildVersion != $build))))' \
+            /tmp/base.json > altsource/AltSource.json
+
+      - name: Commit if changed
+        if: steps.rel.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- altsource/AltSource.json; then
+            echo "feed already up to date"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add altsource/AltSource.json
+          git commit -m "Refresh AltSource: ${{ steps.rel.outputs.version }}+${{ steps.rel.outputs.build }}"
+          git pull --rebase
+          git push
